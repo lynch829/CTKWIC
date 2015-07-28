@@ -8,6 +8,12 @@ test
 # Random files
 .recon_wfbp.sh
 
+# reader headers and library (can't go to github)
+**/definitionasframe.h
+**/read_raw_file.h
+**/sensation64frame.h
+**/read_raw_file.o
+
 # Object files
 **/*.o
 *.ko
