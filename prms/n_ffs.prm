@@ -6,7 +6,7 @@ StartPos:	800.0
 EndPos:		800.0
 SliceThickness:	1.2
 AcqFOV:		500.0
-ReconFOV:	100.0
+ReconFOV:	250.0
 ReconKernel:	3
 Readings:	12918
 Xorigin:	0.0

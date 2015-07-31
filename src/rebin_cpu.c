@@ -139,11 +139,16 @@ void rebin_nffs_cpu(struct recon_metadata *mr){
 }
 
 void rebin_pffs_cpu(struct recon_metadata *mr){
+
     // Set up some constants
     struct ct_geom cg=mr->cg;
+    struct recon_params rp=mr->rp;
     struct recon_info ri=mr->ri;
     const double da=cg.src_to_det*cg.r_f*cg.fan_angle_increment/(4.0f*(cg.src_to_det-cg.r_f));
     int n_proj=mr->ri.n_proj_pull/mr->ri.n_ffs;
+
+    // We want to rebin the 1/4 or 1/8 detector offset away
+    float kwic_central_channel=((float)cg.n_channels_oversampled-1.0f)/2.0f;
 
     // Allocate raw data arrays and intermediate output array
     float * raw_1;
@@ -173,11 +178,25 @@ void rebin_pffs_cpu(struct recon_metadata *mr){
     dim.idx2=cg.n_rows;
     dim.idx3=n_proj;
 
+    // Allocate the lookup table we'll use in the channel rebinning
     float * beta_lookup;
     beta_lookup=(float*)malloc(cg.n_channels_oversampled*sizeof(float));
+
+    // Predetermine our betas so we can reuse throughout computation
+    float * betas_1;
+    float * betas_2;
+    betas_1=(float *)malloc(sizeof(float)*cg.n_channels);
+    betas_2=(float *)malloc(sizeof(float)*cg.n_channels);
+    for (int i=0;i<cg.n_channels;i++){
+	betas_1[i]=beta_rk(da,0,i,0,cg);
+	betas_2[i]=beta_rk(-da,0,i,0,cg);
+	beta_lookup[2*i]=betas_1[i];
+	beta_lookup[2*i+1]=betas_2[i];	
+    }
     
     // Rebin over angles
     for (int proj=0;proj<n_proj;proj++){
+	printf("%d/%d\n",proj,n_proj);
 	for (int row=0;row<cg.n_rows;row++){
 	    for (int channel=0;channel<cg.n_channels;channel++){
 		
@@ -185,15 +204,11 @@ void rebin_pffs_cpu(struct recon_metadata *mr){
 		int out_idx_2=proj*cg.n_channels_oversampled*cg.n_rows+row*cg.n_channels_oversampled+2*channel+1;
 
 		// +da
-		float beta_1_l = beta_rk(da,0,channel,0,cg);
-		float beta_1 = asin((channel-cg.central_channel)*(cg.r_f/r_fr(da,0,cg))*(cg.fan_angle_increment/2));
-		beta_lookup[2*channel]=beta_1_l;
+		float beta_1= betas_1[channel];
 		float alpha_idx_1=ri.n_ffs*(proj)-beta_1*cg.n_proj_ffs/(2.0f*pi)-d_alpha_r(da,0,cg)*cg.n_proj_ffs/(2.0f*pi);
 		
 		// -da
-		float beta_2_l = beta_rk(-da,0,channel,0,cg);
-		float beta_2 = asin((channel-cg.central_channel)*(cg.r_f/r_fr(-da,0,cg))*(cg.fan_angle_increment/2));
-		beta_lookup[2*channel+1]=beta_2_l;
+		float beta_2 = betas_2[channel];
 		float alpha_idx_2=ri.n_ffs*(proj)-beta_2*cg.n_proj_ffs/(2.0f*pi)-d_alpha_r(-da,0,cg)*cg.n_proj_ffs/(2.0f*pi);
 
 		// Rescale alpha indices to properly index the raw arrays as 0, 1, 2, 3, ...
@@ -220,21 +235,39 @@ void rebin_pffs_cpu(struct recon_metadata *mr){
 
     // Update the interpolation array dimensions since new array has twice as many channels
     dim.idx1*=2;
+
+    // Predetermine our betas and beta indices once to minimize lookup searches
+    float * betas;
+    float * beta_indices;
+    betas=(float*)malloc(sizeof(float)*cg.n_channels_oversampled);
+    beta_indices=(float*)malloc(sizeof(float)*cg.n_channels_oversampled);
+    for (int i=0; i<cg.n_channels_oversampled;i++){
+	betas[i]=asin(((float)i-kwic_central_channel)*(rp.recon_fov/(cg.n_channels_oversampled-1))/cg.r_f);
+	beta_indices[i]=get_beta_idx(betas[i],beta_lookup,cg.n_channels_oversampled);
+    }
     
     // Rebin channels
     for (int proj=0;proj<n_proj;proj++){
+	printf("%d/%d\n",proj,n_proj);
 	for (int row=0;row<cg.n_rows;row++){
 	    for (int channel=0;channel<cg.n_channels_oversampled;channel++){
+
+		//float beta  = asin((channel-2*cg.central_channel)*(cg.fan_angle_increment/2));
+		//const float beta=asin(((float)channel-kwic_central_channel)*(rp.recon_fov/(cg.n_channels_oversampled-1))/cg.r_f);
+		float beta=betas[channel];
+
+		//float beta_idx=get_beta_idx(beta,beta_lookup,cg.n_channels_oversampled);
+		float beta_idx=beta_indices[channel];
+		
 		int out_idx=cg.n_channels_oversampled*cg.n_rows*proj+cg.n_channels_oversampled*row+channel;
-		float beta  = asin((channel-2*cg.central_channel)*(cg.fan_angle_increment/2));
-		//float beta_idx=beta/(cg.fan_angle_increment/2.0f)+2.0f*cg.central_channel;
-		float beta_idx=get_beta_idx(beta,beta_lookup,cg.n_channels_oversampled);
 		h_output[out_idx]=interp3(rebin_t,dim,beta_idx,row,proj);
 	    }
 	}
     }
 
     free(rebin_t);
+    free(betas);
+    free(beta_indices);
     
     //Copy data into our mr structure, skipping initial truncated projections
     size_t offset=cg.add_projections;
@@ -246,18 +279,18 @@ void rebin_pffs_cpu(struct recon_metadata *mr){
 	}
     }
 
-    printf("Filtering...\n");
-    
-    // Load and run filter
-    float * h_filter=(float*)calloc(2*cg.n_channels_oversampled,sizeof(float));
-    load_filter(h_filter,mr);
-
-    for (int i=0;i<(n_proj-2*cg.add_projections);i++){
-	for (int j=0;j<cg.n_rows;j++){
-	    int row_start_idx=i*cg.n_channels_oversampled*cg.n_rows+cg.n_channels_oversampled*j;
-	    filter_cpu(&mr->ctd.rebin[row_start_idx],h_filter,cg.n_channels_oversampled);
-	}
-    }
+//    printf("Filtering...\n");
+//    
+//    // Load and run filter
+//    float * h_filter=(float*)calloc(2*cg.n_channels_oversampled,sizeof(float));
+//    load_filter(h_filter,mr);
+//
+//    for (int i=0;i<(n_proj-2*cg.add_projections);i++){
+//	for (int j=0;j<cg.n_rows;j++){
+//	    int row_start_idx=i*cg.n_channels_oversampled*cg.n_rows+cg.n_channels_oversampled*j;
+//	    filter_cpu(&mr->ctd.rebin[row_start_idx],h_filter,cg.n_channels_oversampled);
+//	}
+//    }
     
     // Check "testing" flag, write rebin to disk if set
     if (mr->flags.testing){
@@ -270,7 +303,7 @@ void rebin_pffs_cpu(struct recon_metadata *mr){
     }
 
     free(h_output);
-    free(h_filter);
+    //free(h_filter);
 
 }
 
@@ -457,6 +490,13 @@ void rebin_affs_cpu(struct recon_metadata *mr){
     dim.idx2=cg.n_rows_raw;
     dim.idx3=n_proj;
 
+    // Allocate beta lookup tables
+    // Allocate and compute beta lookup tables
+    float * beta_lookup_1;
+    float * beta_lookup_2;
+    beta_lookup_1=(float*)malloc(sizeof(float)*cg.n_channels_oversampled);
+    beta_lookup_2=(float*)malloc(sizeof(float)*cg.n_channels_oversampled);
+
     // Rebin projections
     for (int proj=0;proj<n_proj;proj++){
 	for (int row=0;row<cg.n_rows_raw;row++){
@@ -474,6 +514,8 @@ void rebin_affs_cpu(struct recon_metadata *mr){
 		// -da
 		float beta_2 = beta_rk(-da,-dr,channel,0,cg);
 		float alpha_idx_2=ri.n_ffs*(proj)-beta_2*cg.n_proj_ffs/(2.0f*pi)-d_alpha_r(-da,-dr,cg)*cg.n_proj_ffs/(2.0f*pi);
+		beta_lookup_1[2*channel]=beta_1;
+		beta_lookup_1[2*channel+1]=beta_2;		
 		// <<<<< -dr
 
 		// +dr >>>>>
@@ -483,6 +525,8 @@ void rebin_affs_cpu(struct recon_metadata *mr){
 		// -da
 		float beta_4 = beta_rk(-da,dr,channel,0,cg);
 		float alpha_idx_4=ri.n_ffs*(proj)-beta_2*cg.n_proj_ffs/(2.0f*pi)-d_alpha_r(-da,dr,cg)*cg.n_proj_ffs/(2.0f*pi);
+		beta_lookup_2[2*channel]=beta_3;
+		beta_lookup_2[2*channel+1]=beta_4;
 		// <<<<< +dr
 
 		// Rescale alpha indices to properly index the raw arrays as 0, 1, 2, 3, ...
@@ -514,16 +558,6 @@ void rebin_affs_cpu(struct recon_metadata *mr){
 
     // Update the interpolation array dimensions since new array has twice as many channels
     dim.idx1*=2;
-
-    // Allocate and compute beta lookup tables
-    float * beta_lookup_1;
-    float * beta_lookup_2;
-    beta_lookup_1=(float*)malloc(cg.n_channels_oversampled*sizeof(float));
-    beta_lookup_2=(float*)malloc(cg.n_channels_oversampled*sizeof(float));
-    for (int i=0;i<cg.n_channels_oversampled;i++){
-	beta_lookup_1[i]=beta_rk(0,-dr,i,1,cg);
-	beta_lookup_2[i]=beta_rk(0, dr,i,1,cg);
-    }
 
     // Rebin channels
     for (int proj=0;proj<n_proj;proj++){
