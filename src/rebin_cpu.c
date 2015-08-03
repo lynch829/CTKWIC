@@ -317,7 +317,10 @@ void rebin_zffs_cpu(struct recon_metadata *mr){
     const double da=0.0;
     const double dr=cg.src_to_det*rp.coll_slicewidth/(4.0*(cg.src_to_det-cg.r_f)*tan(cg.anode_angle));
     int n_proj=mr->ri.n_proj_pull/mr->ri.n_ffs;
-    
+
+    // We want to rebin the 1/4 or 1/8 detector offset away
+    float kwic_central_channel=((float)cg.n_channels_oversampled-1.0f)/2.0f;
+
     // Allocate raw data arrays and final output array
     float * raw_1;
     raw_1=(float*)malloc(cg.n_channels*cg.n_rows*n_proj*sizeof(float));
@@ -349,6 +352,22 @@ void rebin_zffs_cpu(struct recon_metadata *mr){
     for (int i=0;i<cg.n_channels;i++){
 	beta_lookup_1[i]=beta_rk(da,-dr,i,0,cg);
 	beta_lookup_2[i]=beta_rk(da, dr,i,0,cg);
+    }    
+
+    // Precompute betas and beta indices
+    float * betas_1;
+    float * betas_2;
+    betas_1=(float*)malloc(cg.n_channels_oversampled*sizeof(float));
+    betas_2=(float*)malloc(cg.n_channels_oversampled*sizeof(float));
+    float * beta_indices_1;
+    float * beta_indices_2;
+    beta_indices_1=(float*)malloc(cg.n_channels_oversampled*sizeof(float));
+    beta_indices_2=(float*)malloc(cg.n_channels_oversampled*sizeof(float));
+    for (int i=0;i<cg.n_channels_oversampled;i++){
+	betas_1[i]=asin(((float)i-kwic_central_channel)*(rp.recon_fov/(cg.n_channels_oversampled-1))/r_fr(0.0f,-dr,cg));
+	betas_2[i]=asin(((float)i-kwic_central_channel)*(rp.recon_fov/(cg.n_channels_oversampled-1))/r_fr(0.0f, dr,cg));
+	beta_indices_1[i]=get_beta_idx(betas_1[i],beta_lookup_1,cg.n_channels);
+	beta_indices_2[i]=get_beta_idx(betas_2[i],beta_lookup_2,cg.n_channels);	
     }
 
     // Set up interpolation array dims
@@ -358,18 +377,21 @@ void rebin_zffs_cpu(struct recon_metadata *mr){
     dim.idx3=n_proj;
 
     for (int proj=0;proj<n_proj;proj++){
+	printf("Projection %d/%d\n",proj,n_proj);
 	for (int row=0;row<cg.n_rows_raw;row++){
 	    for (int channel=0;channel<cg.n_channels_oversampled;channel++){
 
 		// da=0, dr= -dr
- 		float beta_1=asin((channel-2.0f*cg.central_channel)*(cg.fan_angle_increment/2.0f)*cg.r_f/r_fr(0.0f,-dr,cg));
+ 		//float beta_1=asin((channel-2.0f*cg.central_channel)*(cg.fan_angle_increment/2.0f)*cg.r_f/r_fr(0.0f,-dr,cg));
+		float beta_1=betas_1[channel];
 		float alpha_idx_1=ri.n_ffs*(proj)-beta_1*cg.n_proj_ffs/(2.0f*pi)-d_alpha_r(da,-dr,cg)*cg.n_proj_ffs/(2.0f*pi);
-		float beta_idx_1=get_beta_idx(beta_1,beta_lookup_1,cg.n_channels);
+		float beta_idx_1=beta_indices_1[channel];
 
 		// da=0, dr= +dr
-		float beta_2=asin((channel-2.0f*cg.central_channel)*(cg.fan_angle_increment/2.0f)*cg.r_f/r_fr(0.0f,dr,cg));
+		//float beta_2=asin((channel-2.0f*cg.central_channel)*(cg.fan_angle_increment/2.0f)*cg.r_f/r_fr(0.0f,dr,cg));
+		float beta_2=betas_2[channel];
 		float alpha_idx_2=ri.n_ffs*(proj)-beta_2*cg.n_proj_ffs/(2.0f*pi)-d_alpha_r(da,dr,cg)*cg.n_proj_ffs/(2.0f*pi);
-		float beta_idx_2=get_beta_idx(beta_2,beta_lookup_2,cg.n_channels);
+		float beta_idx_2=beta_indices_2[channel];
 
 		// Rescale alpha indices to properly index the raw arrays as 0, 1, 2, 3, ...
 		alpha_idx_1=alpha_idx_1/2.0f; // raw_1 contains alpha projections 0, 2, 4, 6, ...
@@ -394,18 +416,18 @@ void rebin_zffs_cpu(struct recon_metadata *mr){
 	}
     }
 
-    printf("Filtering...\n");
-    
-    // Load and run filter
-    float * h_filter=(float*)calloc(2*cg.n_channels_oversampled,sizeof(float));
-    load_filter(h_filter,mr);
-
-    for (int i=0;i<(n_proj-2*cg.add_projections);i++){
-	for (int j=0;j<cg.n_rows;j++){
-	    int row_start_idx=i*cg.n_channels_oversampled*cg.n_rows+cg.n_channels_oversampled*j;
-	    filter_cpu(&mr->ctd.rebin[row_start_idx],h_filter,cg.n_channels_oversampled);
-	}
-    }
+//    printf("Filtering...\n");
+//    
+//    // Load and run filter
+//    float * h_filter=(float*)calloc(2*cg.n_channels_oversampled,sizeof(float));
+//    load_filter(h_filter,mr);
+//
+//    for (int i=0;i<(n_proj-2*cg.add_projections);i++){
+//	for (int j=0;j<cg.n_rows;j++){
+//	    int row_start_idx=i*cg.n_channels_oversampled*cg.n_rows+cg.n_channels_oversampled*j;
+//	    filter_cpu(&mr->ctd.rebin[row_start_idx],h_filter,cg.n_channels_oversampled);
+//	}
+//    }
     
     // Check "testing" flag, write rebin to disk if set
     if (mr->flags.testing){
@@ -422,7 +444,7 @@ void rebin_zffs_cpu(struct recon_metadata *mr){
     free(beta_lookup_1);
     free(beta_lookup_2);
     free(h_output);
-    free(h_filter);
+//    free(h_filter);
 
 }
 
